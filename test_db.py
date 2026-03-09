@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import sqlite3
 conn = sqlite3.connect(":memory:", isolation_level=None)
 conn.execute("CREATE TABLE foo (bar TEXT)")

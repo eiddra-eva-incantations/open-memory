@@ -11,12 +11,12 @@ import threading
 import fcntl
 import gc
 import sqlite_vec
-import torch
+import urllib.request
+import urllib.error
 import numpy as np
 import networkx as nx
 from typing import Dict, Any, List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from sentence_transformers import SentenceTransformer, CrossEncoder
 
 # --- Configuration & Models ---
 DB_PATH = '/home/eiddra/mcp-servers/open-memory/data/memory.db'
@@ -25,132 +25,9 @@ EMBED_MODEL_NAME = 'Qwen/Qwen3-Embedding-4B'
 RERANK_MODEL_NAME = 'Qwen/Qwen3-Reranker-4B'
 VEC_DIM = 1024 
 
-# Detect CUDA
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
-model = None
-reranker = None
-
-# --- Model VRAM Manager ---
-class ModelVRAMManager:
-    def __init__(self):
-        self.lock_file = "/tmp/openmemory_gpu.lock"
-        self.lock_fd = None
-        self.last_used = time.time()
-        self.active_count = 0 
-        self.lock = threading.RLock()
-        self.on_cuda = False
-        
-        # Start watchdog
-        self.watchdog = threading.Thread(target=self._watchdog_loop, daemon=True)
-        self.watchdog.start()
-        
-    def acquire(self):
-        with self.lock:
-            self.active_count += 1
-            self.last_used = time.time()
-            if self.active_count == 1:
-                self.lock_fd = open(self.lock_file, 'w')
-                fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
-                
-                global model, reranker
-                try:
-                    if model is not None:
-                        model.to(device)
-                    if reranker is not None:
-                        reranker.model.to(device)
-                    self.on_cuda = True
-                except RuntimeError as e:
-                    if 'out of memory' in str(e).lower():
-                        log("CUDA OOM detected! Falling back to CPU inference...", level="WARN")
-                        if model is not None:
-                            model.to('cpu')
-                        if reranker is not None:
-                            reranker.model.to('cpu')
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        self.on_cuda = False
-                    else:
-                        raise e
-
-    def release(self):
-        with self.lock:
-            self.active_count -= 1
-            self.last_used = time.time()
-            if self.active_count == 0:
-                global model, reranker
-                if model is not None:
-                    model.to('cpu')
-                if reranker is not None:
-                    reranker.model.to('cpu')
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                self.on_cuda = False
-                
-                if self.lock_fd:
-                    fcntl.flock(self.lock_fd, fcntl.LOCK_UN)
-                    self.lock_fd.close()
-                    self.lock_fd = None
-
-    def _watchdog_loop(self):
-        while True:
-            time.sleep(10)
-            with self.lock:
-                if self.active_count > 0:
-                    continue
-                # 5 minutes of complete inactivity
-                if time.time() - self.last_used > 300: 
-                    global model, reranker
-                    if model is not None or reranker is not None:
-                        log("Models idle for 5 minutes. Unloading completely...")
-                        model = None
-                        reranker = None
-                        gc.collect()
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-
-vram_manager = ModelVRAMManager()
-
-class GPUContext:
-    def __enter__(self):
-        vram_manager.acquire()
-        return self
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        vram_manager.release()
-
-def get_embedding_model():
-    """Lazy-load only the embedding model into system RAM."""
-    global model
-    if model is None:
-        log("Loading embedding model into system RAM (float16)...")
-        model = SentenceTransformer(
-            EMBED_MODEL_NAME, 
-            device='cpu', 
-            trust_remote_code=True,
-            model_kwargs={"torch_dtype": torch.float16}
-        )
-        if vram_manager.on_cuda:
-            model.to(device)
-    return model
-
-def get_reranker():
-    """Lazy-load only the reranker model into system RAM."""
-    global reranker
-    if reranker is None:
-        log("Loading reranker model into system RAM (float16)...")
-        reranker = CrossEncoder(
-            RERANK_MODEL_NAME, 
-            device='cpu', 
-            trust_remote_code=True,
-            model_kwargs={"torch_dtype": torch.float16}
-        )
-        if reranker.tokenizer.pad_token is None:
-            reranker.tokenizer.pad_token = reranker.tokenizer.eos_token
-        if reranker.model.config.pad_token_id is None:
-            reranker.model.config.pad_token_id = reranker.tokenizer.pad_token_id or 0
-        if vram_manager.on_cuda:
-            reranker.model.to(device)
-    return reranker
+# Daemon config
+MODEL_DAEMON_URL = "http://127.0.0.1:50051"
 
 
 LOG_LEVEL = os.environ.get("OPENMEMORY_LOG_LEVEL", "INFO").upper()
@@ -392,10 +269,19 @@ def calculate_decay(initial_salience: float, decay_lambda: float, last_seen_ts: 
     return initial_salience * np.exp(-decay_lambda * days)
 
 def encode_flagship(text: str) -> np.ndarray:
-    with GPUContext():
-        m = get_embedding_model()
-        full_vec = m.encode(text).astype(np.float32)
-        return full_vec[:VEC_DIM] if len(full_vec) > VEC_DIM else full_vec
+    req = urllib.request.Request(
+        f"{MODEL_DAEMON_URL}/encode",
+        data=json.dumps({"text": text}).encode('utf-8'),
+        headers={'Content-Type': 'application/json'},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=300) as response:
+            res_data = json.loads(response.read().decode())
+            full_vec = np.array(res_data["vector"], dtype=np.float32)
+            return full_vec[:VEC_DIM] if len(full_vec) > VEC_DIM else full_vec
+    except Exception as e:
+        log(f"Error calling model daemon encode: {e}", level="ERROR")
+        raise
 
 # --- Core Operations ---
 
@@ -597,7 +483,7 @@ def query_memories(query: str, query_type: str = "contextual", sector: str = Non
             
             # 2. Keyword Search (FTS5)
             # Sanitize: strip FTS5 special operators, wrap in phrase query
-            sanitized_query = re.sub(r'["*()\-]+', ' ', query).strip()
+            sanitized_query = re.sub(r'["*()\-+]+', ' ', query).strip().lower()
             if sanitized_query:
                 try:
                     cursor.execute("SELECT mem_id, rank FROM fts_memories WHERE content MATCH ? LIMIT 5", (f'"{sanitized_query}"',))
@@ -640,13 +526,25 @@ def query_memories(query: str, query_type: str = "contextual", sector: str = Non
             
             candidate_list = list(candidates.values())
             if candidate_list:
-                with GPUContext():
-                    reranker_model = get_reranker()
-                    pairs = [(query, c["content"]) for c in candidate_list]
-                    rerank_scores = reranker_model.predict(pairs, batch_size=4)
-                    for i, score in enumerate(rerank_scores):
-                        c = candidate_list[i]
-                        c["score"] = (0.6 * float(score)) + (0.1 * c["salience"]) + (0.1 * c["recency"]) + (0.1 * c["waypoint"]) + (0.1 * c["fts_boost"])
+                # Rerank via Daemon
+                documents = [c["content"] for c in candidate_list]
+                req = urllib.request.Request(
+                    f"{MODEL_DAEMON_URL}/rerank",
+                    data=json.dumps({"query": query, "documents": documents}).encode('utf-8'),
+                    headers={'Content-Type': 'application/json'},
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=300) as response:
+                        res_data = json.loads(response.read().decode())
+                        rerank_scores = res_data.get("scores", [])
+                        for i, score in enumerate(rerank_scores):
+                            c = candidate_list[i]
+                            c["score"] = (0.6 * float(score)) + (0.1 * c["salience"]) + (0.1 * c["recency"]) + (0.1 * c["waypoint"]) + (0.1 * c["fts_boost"])
+                except Exception as e:
+                    log(f"Error calling model daemon rerank: {e}", level="ERROR")
+                    # Fallback to base score if reranking fails
+                    for c in candidate_list:
+                        c["score"] = (0.1 * c["salience"]) + (0.1 * c["recency"]) + (0.1 * c["waypoint"]) + (0.1 * c["fts_boost"])
                 candidate_list.sort(key=lambda x: x["score"], reverse=True)
                 results["contextual"] = candidate_list[:k]
                 
@@ -2214,10 +2112,9 @@ def evaluate_entropy(query: str) -> float:
             # Fallback length heuristic: longer queries tend to be more complex/abstract
             return min(1.0, len(query) / 200.0)
             
-        with GPUContext():
-            vecs = [encode_flagship(c).numpy() for c in chunks]
-            vecs_np = np.stack(vecs)
-            variance = np.var(vecs_np, axis=0).mean() # Mean variance across all 1024 dims
+        vecs = [encode_flagship(c) for c in chunks]
+        vecs_np = np.stack(vecs)
+        variance = np.var(vecs_np, axis=0).mean() # Mean variance across all 1024 dims
         
         # Normalize (empirical bounds for Qwen3 1024D embeddings)
         # Low variance < 0.005, High variance > 0.02
